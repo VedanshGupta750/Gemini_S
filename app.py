@@ -9,9 +9,13 @@ from dotenv import load_dotenv
 import fitz  # PyMuPDF
 from io import BytesIO
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # Import CORS
 
 # Initialize Flask app
 app = Flask(__name__)
+
+# Enable CORS for all routes and all origins (for development)
+CORS(app)
 
 # Load environment variables
 load_dotenv()
@@ -269,7 +273,7 @@ def extract_json_from_images_with_gemini(image_paths, api_key):
         elif raw_json_text.startswith('[') or raw_json_text.startswith('{'):
             pass  # Already looks like JSON, proceed
         else:
-            json_match = re.search(r'\{.*\}|$$   .*   $$', raw_json_text, re.DOTALL)
+            json_match = re.search(r'\{.*\}|$$     .*     $$', raw_json_text, re.DOTALL)
             if json_match:
                 raw_json_text = json_match.group(0).strip()
             else:
