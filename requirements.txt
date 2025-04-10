@@ -1,0 +1,6 @@
+
+Flask
+Pillow
+psycopg2-binary
+google-generativeai
+werkzeug
