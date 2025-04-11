@@ -15,7 +15,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-# Configure CORS with specific origins and methods
 CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "https://your-deployed-frontend.com"], 
                             "methods": ["GET", "POST", "OPTIONS"], 
                             "allow_headers": ["Content-Type"]}})
@@ -63,12 +62,11 @@ def get_db_connection():
 @app.route('/upload', methods=['POST', 'OPTIONS'])
 def upload_files():
     if request.method == 'OPTIONS':
-        return '', 200  # Handle CORS preflight
+        return '', 200
     try:
         if 'files' not in request.files:
             logger.warning("No files in request")
             return jsonify({'error': 'No files uploaded'}), 400
-
         files = request.files.getlist('files')
         if not files or all(f.filename == '' for f in files):
             logger.warning("Empty file list or no valid files")
@@ -76,8 +74,7 @@ def upload_files():
 
         data_entries = []
         for file in files:
-            # Replace with your original Gemini logic
-            gemini_result = {}  # Mocked - use your actual call
+            gemini_result = {}  # Replace with your original Gemini logic
             entry = {
                 'DATE': datetime.now().strftime('%Y-%m-%d'),
                 'PARTICULARS': gemini_result.get('description', 'Processed File'),
@@ -122,52 +119,59 @@ def upload_files():
 
         cur.close()
         conn.close()
-        logger.info(f"Uploaded {len(files)} files successfully")
+        logger.info(f"Uploaded {len(files)} files successfully via /upload")
         return jsonify({'message': 'Files processed'}), 200
 
     except Exception as e:
         logger.error(f"Upload error: {e}")
         return jsonify({'error': str(e)}), 500
 
-# New upload route with Gemini 2.0 Flash
+# Updated upload-flash with detailed error logging
 @app.route('/upload-flash', methods=['POST', 'OPTIONS'])
 def upload_files_flash():
     if request.method == 'OPTIONS':
-        return '', 200  # Handle CORS preflight
+        return '', 200
     try:
         if 'files' not in request.files:
             logger.warning("No files in request")
             return jsonify({'error': 'No files uploaded'}), 400
-
         files = request.files.getlist('files')
         if not files or all(f.filename == '' for f in files):
             logger.warning("Empty file list or no valid files")
             return jsonify({'error': 'No valid files uploaded'}), 400
 
+        logger.info(f"Processing {len(files)} files with Gemini 2.0 Flash")
         data_entries = []
         for file in files:
-            file_content = file.read()
-            response = gemini_model.generate_content([
-                {"mime_type": file.mimetype, "data": file_content},
-                {"text": "Extract financial data: description, bill number, quantity, amount."}
-            ])
-            gemini_result = response.text
-            gemini_data = json.loads(gemini_result) if gemini_result.startswith('{') else {
-                'description': gemini_result, 'bill_no': 'N/A', 'quantity': 0, 'amount': 0.0
-            }
-            entry = {
-                'DATE': datetime.now().strftime('%Y-%m-%d'),
-                'PARTICULARS': gemini_data.get('description', 'Processed File'),
-                'Voucher_BillNo': gemini_data.get('bill_no', 'N/A'),
-                'RECEIPTS_Quantity': int(gemini_data.get('quantity', 0)),
-                'RECEIPTS_Amount': float(gemini_data.get('amount', 0.0)),
-                'ISSUED_Quantity': 0,
-                'ISSUED_Amount': 0.0,
-                'BALANCE_Quantity': int(gemini_data.get('quantity', 0)),
-                'BALANCE_Amount': float(gemini_data.get('amount', 0.0))
-            }
-            data_entries.append(entry)
+            try:
+                file_content = file.read()
+                logger.debug(f"Processing file: {file.filename}, size: {len(file_content)} bytes")
+                response = gemini_model.generate_content([
+                    {"mime_type": file.mimetype, "data": file_content},
+                    {"text": "Extract financial data: description, bill number, quantity, amount."}
+                ])
+                gemini_result = response.text
+                logger.debug(f"Gemini result: {gemini_result}")
+                gemini_data = json.loads(gemini_result) if gemini_result.startswith('{') else {
+                    'description': gemini_result, 'bill_no': 'N/A', 'quantity': 0, 'amount': 0.0
+                }
+                entry = {
+                    'DATE': datetime.now().strftime('%Y-%m-%d'),
+                    'PARTICULARS': gemini_data.get('description', 'Processed File'),
+                    'Voucher_BillNo': gemini_data.get('bill_no', 'N/A'),
+                    'RECEIPTS_Quantity': int(gemini_data.get('quantity', 0)),
+                    'RECEIPTS_Amount': float(gemini_data.get('amount', 0.0)),
+                    'ISSUED_Quantity': 0,
+                    'ISSUED_Amount': 0.0,
+                    'BALANCE_Quantity': int(gemini_data.get('quantity', 0)),
+                    'BALANCE_Amount': float(gemini_data.get('amount', 0.0))
+                }
+                data_entries.append(entry)
+            except Exception as e:
+                logger.error(f"Gemini processing failed for {file.filename}: {e}")
+                raise
 
+        logger.info("Inserting into PostgreSQL")
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         for entry in data_entries:
@@ -185,6 +189,7 @@ def upload_files_flash():
             entry['Entry_ID'] = cur.fetchone()['Entry_ID']
         conn.commit()
 
+        logger.info("Syncing to Google Sheets")
         spreadsheet_id = os.getenv('SPREADSHEET_ID', 'your_spreadsheet_id')
         values = [[e['Entry_ID'], e['DATE'], e['PARTICULARS'], e['Voucher_BillNo'],
                    e['RECEIPTS_Quantity'], e['RECEIPTS_Amount'], e['ISSUED_Quantity'],
@@ -199,15 +204,14 @@ def upload_files_flash():
 
         cur.close()
         conn.close()
-        logger.info(f"Uploaded {len(files)} files successfully via flash")
-        return jsonify({'message': 'Files processed and synced to Google Sheet',
-                        'sheet_url': f'https://docs.google.com/spreadsheets/d/{spreadsheet_id}'}), 200
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/preview"
+        logger.info(f"Upload successful, sheet URL: {sheet_url}")
+        return jsonify({'message': 'Files processed and synced to Google Sheet', 'sheet_url': sheet_url}), 200
 
     except Exception as e:
-        logger.error(f"Upload flash error: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Upload-flash error: {e}")
+        return jsonify({'error': f"Failed to process files: {str(e)}"}), 500
 
-# Remaining routes unchanged for brevity (add back /results, /update, /export-to-sheet as needed)
 @app.route('/results', methods=['GET'])
 def get_results():
     try:
@@ -217,6 +221,7 @@ def get_results():
         data = cur.fetchall()
         cur.close()
         conn.close()
+        logger.info("Fetched results successfully")
         return jsonify(data), 200
     except Exception as e:
         logger.error(f"Results error: {e}")
@@ -257,6 +262,7 @@ def update_data():
 
         cur.close()
         conn.close()
+        logger.info("Data updated successfully")
         return jsonify({'message': 'Data updated'}), 200
     except Exception as e:
         logger.error(f"Update error: {e}")
@@ -282,6 +288,7 @@ def export_to_sheet():
         ).execute()
 
         shareable_link = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+        logger.info(f"Exported to new sheet: {shareable_link}")
         return jsonify({'message': 'Sheet created', 'link': shareable_link}), 200
     except Exception as e:
         logger.error(f"Export error: {e}")
