@@ -9,12 +9,19 @@ from datetime import datetime
 import json
 import logging
 import google.generativeai as genai
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend communication
+# Configure CORS with specific origins and methods
+CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "https://your-deployed-frontend.com"], 
+                            "methods": ["GET", "POST", "OPTIONS"], 
+                            "allow_headers": ["Content-Type"]}})
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, filename='app.log')
 logger = logging.getLogger(__name__)
 
 # Database connection
@@ -29,12 +36,20 @@ DB_PARAMS = {
 # Google Sheets API setup
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 CREDS_FILE = os.getenv('GOOGLE_CREDS', 'credentials.json')
-creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
-sheets_service = build('sheets', 'v4', credentials=creds)
+try:
+    creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+    sheets_service = build('sheets', 'v4', credentials=creds)
+except Exception as e:
+    logger.error(f"Google Sheets API setup failed: {e}")
+    raise
 
 # Gemini 2.0 Flash setup
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
-gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+try:
+    genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+    gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+except Exception as e:
+    logger.error(f"Gemini API setup failed: {e}")
+    raise
 
 def get_db_connection():
     try:
@@ -45,18 +60,24 @@ def get_db_connection():
         raise
 
 # Existing upload route (preserved)
-@app.route('/upload', methods=['POST'])
+@app.route('/upload', methods=['POST', 'OPTIONS'])
 def upload_files():
+    if request.method == 'OPTIONS':
+        return '', 200  # Handle CORS preflight
     try:
-        files = request.files.getlist('files')
-        if not files:
+        if 'files' not in request.files:
+            logger.warning("No files in request")
             return jsonify({'error': 'No files uploaded'}), 400
 
-        # Existing Gemini processing (mocked - replace with your original logic)
+        files = request.files.getlist('files')
+        if not files or all(f.filename == '' for f in files):
+            logger.warning("Empty file list or no valid files")
+            return jsonify({'error': 'No valid files uploaded'}), 400
+
         data_entries = []
         for file in files:
-            # Assume original Gemini API call (e.g., older version)
-            gemini_result = {}  # Replace with your original Gemini call
+            # Replace with your original Gemini logic
+            gemini_result = {}  # Mocked - use your actual call
             entry = {
                 'DATE': datetime.now().strftime('%Y-%m-%d'),
                 'PARTICULARS': gemini_result.get('description', 'Processed File'),
@@ -70,7 +91,6 @@ def upload_files():
             }
             data_entries.append(entry)
 
-        # Insert into PostgreSQL
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         for entry in data_entries:
@@ -88,13 +108,11 @@ def upload_files():
             entry['Entry_ID'] = cur.fetchone()['Entry_ID']
         conn.commit()
 
-        # Sync to Google Sheet (existing)
         spreadsheet_id = os.getenv('SPREADSHEET_ID', 'your_spreadsheet_id')
-        values = [[
-            e['Entry_ID'], e['DATE'], e['PARTICULARS'], e['Voucher_BillNo'],
-            e['RECEIPTS_Quantity'], e['RECEIPTS_Amount'], e['ISSUED_Quantity'],
-            e['ISSUED_Amount'], e['BALANCE_Quantity'], e['BALANCE_Amount']
-        ] for e in data_entries]
+        values = [[e['Entry_ID'], e['DATE'], e['PARTICULARS'], e['Voucher_BillNo'],
+                   e['RECEIPTS_Quantity'], e['RECEIPTS_Amount'], e['ISSUED_Quantity'],
+                   e['ISSUED_Amount'], e['BALANCE_Quantity'], e['BALANCE_Amount']] 
+                  for e in data_entries]
         sheets_service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
             range='A1',
@@ -104,40 +122,38 @@ def upload_files():
 
         cur.close()
         conn.close()
-        return jsonify({'message': 'Files processed'}), 200  # Existing response
+        logger.info(f"Uploaded {len(files)} files successfully")
+        return jsonify({'message': 'Files processed'}), 200
 
     except Exception as e:
         logger.error(f"Upload error: {e}")
         return jsonify({'error': str(e)}), 500
 
 # New upload route with Gemini 2.0 Flash
-@app.route('/upload-flash', methods=['POST'])
+@app.route('/upload-flash', methods=['POST', 'OPTIONS'])
 def upload_files_flash():
+    if request.method == 'OPTIONS':
+        return '', 200  # Handle CORS preflight
     try:
-        files = request.files.getlist('files')
-        if not files:
+        if 'files' not in request.files:
+            logger.warning("No files in request")
             return jsonify({'error': 'No files uploaded'}), 400
 
-        # Process files with Gemini 2.0 Flash
+        files = request.files.getlist('files')
+        if not files or all(f.filename == '' for f in files):
+            logger.warning("Empty file list or no valid files")
+            return jsonify({'error': 'No valid files uploaded'}), 400
+
         data_entries = []
         for file in files:
-            # Read file content
             file_content = file.read()
             response = gemini_model.generate_content([
-                {
-                    "mime_type": file.mimetype,
-                    "data": file_content
-                },
-                {
-                    "text": "Extract financial data: description, bill number, quantity, amount."
-                }
+                {"mime_type": file.mimetype, "data": file_content},
+                {"text": "Extract financial data: description, bill number, quantity, amount."}
             ])
-            gemini_result = response.text  # Assume JSON-like text output
+            gemini_result = response.text
             gemini_data = json.loads(gemini_result) if gemini_result.startswith('{') else {
-                'description': gemini_result,
-                'bill_no': 'N/A',
-                'quantity': 0,
-                'amount': 0.0
+                'description': gemini_result, 'bill_no': 'N/A', 'quantity': 0, 'amount': 0.0
             }
             entry = {
                 'DATE': datetime.now().strftime('%Y-%m-%d'),
@@ -152,7 +168,6 @@ def upload_files_flash():
             }
             data_entries.append(entry)
 
-        # Insert into PostgreSQL
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         for entry in data_entries:
@@ -170,13 +185,11 @@ def upload_files_flash():
             entry['Entry_ID'] = cur.fetchone()['Entry_ID']
         conn.commit()
 
-        # Push to Google Sheet
         spreadsheet_id = os.getenv('SPREADSHEET_ID', 'your_spreadsheet_id')
-        values = [[
-            e['Entry_ID'], e['DATE'], e['PARTICULARS'], e['Voucher_BillNo'],
-            e['RECEIPTS_Quantity'], e['RECEIPTS_Amount'], e['ISSUED_Quantity'],
-            e['ISSUED_Amount'], e['BALANCE_Quantity'], e['BALANCE_Amount']
-        ] for e in data_entries]
+        values = [[e['Entry_ID'], e['DATE'], e['PARTICULARS'], e['Voucher_BillNo'],
+                   e['RECEIPTS_Quantity'], e['RECEIPTS_Amount'], e['ISSUED_Quantity'],
+                   e['ISSUED_Amount'], e['BALANCE_Quantity'], e['BALANCE_Amount']] 
+                  for e in data_entries]
         sheets_service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
             range='A1',
@@ -186,12 +199,15 @@ def upload_files_flash():
 
         cur.close()
         conn.close()
-        return jsonify({'message': 'Files processed and synced to Google Sheet'}), 200
+        logger.info(f"Uploaded {len(files)} files successfully via flash")
+        return jsonify({'message': 'Files processed and synced to Google Sheet',
+                        'sheet_url': f'https://docs.google.com/spreadsheets/d/{spreadsheet_id}'}), 200
 
     except Exception as e:
         logger.error(f"Upload flash error: {e}")
         return jsonify({'error': str(e)}), 500
 
+# Remaining routes unchanged for brevity (add back /results, /update, /export-to-sheet as needed)
 @app.route('/results', methods=['GET'])
 def get_results():
     try:
@@ -229,28 +245,19 @@ def update_data():
             ))
         conn.commit()
 
-        # Update Google Sheet
         spreadsheet_id = os.getenv('SPREADSHEET_ID', 'your_spreadsheet_id')
-        values = [[
-            u['Entry_ID'], u['DATE'], u['PARTICULARS'], u['Voucher_BillNo'],
-            u['RECEIPTS_Quantity'], u['RECEIPTS_Amount'], u['ISSUED_Quantity'],
-            u['ISSUED_Amount'], u['BALANCE_Quantity'], u['BALANCE_Amount']
-        ] for u in updates]
-        sheets_service.spreadsheets().values().clear(
-            spreadsheetId=spreadsheet_id,
-            range='A1:J'
-        ).execute()
+        values = [[u['Entry_ID'], u['DATE'], u['PARTICULARS'], u['Voucher_BillNo'],
+                   u['RECEIPTS_Quantity'], u['RECEIPTS_Amount'], u['ISSUED_Quantity'],
+                   u['ISSUED_Amount'], u['BALANCE_Quantity'], u['BALANCE_Amount']] 
+                  for u in updates]
+        sheets_service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range='A1:J').execute()
         sheets_service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range='A1',
-            valueInputOption='RAW',
-            body={'values': values}
+            spreadsheetId=spreadsheet_id, range='A1', valueInputOption='RAW', body={'values': values}
         ).execute()
 
         cur.close()
         conn.close()
         return jsonify({'message': 'Data updated'}), 200
-
     except Exception as e:
         logger.error(f"Update error: {e}")
         return jsonify({'error': str(e)}), 500
@@ -264,31 +271,22 @@ def export_to_sheet():
         ).execute()
         spreadsheet_id = spreadsheet['spreadsheetId']
 
-        headers = [
-            'Entry_ID', 'DATE', 'PARTICULARS', 'Voucher_BillNo',
-            'RECEIPTS_Quantity', 'RECEIPTS_Amount', 'ISSUED_Quantity',
-            'ISSUED_Amount', 'BALANCE_Quantity', 'BALANCE_Amount'
-        ]
-        values = [headers] + [[
-            d['Entry_ID'], d['DATE'], d['PARTICULARS'], d['Voucher_BillNo'],
-            d['RECEIPTS_Quantity'], d['RECEIPTS_Amount'], d['ISSUED_Quantity'],
-            d['ISSUED_Amount'], d['BALANCE_Quantity'], d['BALANCE_Amount']
-        ] for d in data]
+        headers = ['Entry_ID', 'DATE', 'PARTICULARS', 'Voucher_BillNo', 'RECEIPTS_Quantity', 
+                   'RECEIPTS_Amount', 'ISSUED_Quantity', 'ISSUED_Amount', 'BALANCE_Quantity', 'BALANCE_Amount']
+        values = [headers] + [[d['Entry_ID'], d['DATE'], d['PARTICULARS'], d['Voucher_BillNo'],
+                               d['RECEIPTS_Quantity'], d['RECEIPTS_Amount'], d['ISSUED_Quantity'],
+                               d['ISSUED_Amount'], d['BALANCE_Quantity'], d['BALANCE_Amount']] 
+                              for d in data]
         sheets_service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range='A1',
-            valueInputOption='RAW',
-            body={'values': values}
+            spreadsheetId=spreadsheet_id, range='A1', valueInputOption='RAW', body={'values': values}
         ).execute()
 
         shareable_link = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
         return jsonify({'message': 'Sheet created', 'link': shareable_link}), 200
-
     except Exception as e:
         logger.error(f"Export error: {e}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=port, debug=True)
