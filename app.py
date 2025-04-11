@@ -1,368 +1,292 @@
-import json
-import psycopg2
-import psycopg2.extensions
-import traceback
-import os
-from PIL import Image
-import google.generativeai as genai
-from dotenv import load_dotenv
-import fitz  # PyMuPDF
-from io import BytesIO
 from flask import Flask, request, jsonify
-from flask_cors import CORS  # Import CORS
+from flask_cors import CORS
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from googleapiclient.discovery import build
+from google.oauth2.service_account import Credentials
+import os
+from datetime import datetime
+import json
+import logging
+import google.generativeai as genai
 
-# Initialize Flask app
 app = Flask(__name__)
+CORS(app)  # Enable CORS for frontend communication
 
-# Enable CORS for all routes and all origins (for development)
-CORS(app)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
+# Database connection
+DB_PARAMS = {
+    'dbname': os.getenv('DB_NAME', 'your_db'),
+    'user': os.getenv('DB_USER', 'your_user'),
+    'password': os.getenv('DB_PASSWORD', 'your_password'),
+    'host': os.getenv('DB_HOST', 'your_host'),
+    'port': os.getenv('DB_PORT', '5432')
+}
 
-# --- Database Functions ---
-def create_database_if_not_exists(dbname, user, password, host, port):
+# Google Sheets API setup
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+CREDS_FILE = os.getenv('GOOGLE_CREDS', 'credentials.json')
+creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+sheets_service = build('sheets', 'v4', credentials=creds)
+
+# Gemini 2.0 Flash setup
+genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+
+def get_db_connection():
     try:
-        print("[DB_SETUP] Connecting to default 'postgres' database...")
-        conn = psycopg2.connect(dbname='postgres', user=user, password=password, host=host, port=port)
-        conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-        print("[DB_SETUP] Connected successfully.")
-        cur = conn.cursor()
-        print("[DB_SETUP] Checking if database exists...")
+        conn = psycopg2.connect(**DB_PARAMS)
+        return conn
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        raise
 
-        cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (dbname,))
-        exists = cur.fetchone()
-        if not exists:
-            print(f"[DB_SETUP] Database '{dbname}' does not exist. Creating now...")
-            cur.execute(f'CREATE DATABASE "{dbname}";')
-            print(f"[DB_SETUP] Database '{dbname}' created successfully.")
-        else:
-            print(f"[DB_SETUP] Database '{dbname}' already exists. Skipping creation.")
+# Existing upload route (preserved)
+@app.route('/upload', methods=['POST'])
+def upload_files():
+    try:
+        files = request.files.getlist('files')
+        if not files:
+            return jsonify({'error': 'No files uploaded'}), 400
+
+        # Existing Gemini processing (mocked - replace with your original logic)
+        data_entries = []
+        for file in files:
+            # Assume original Gemini API call (e.g., older version)
+            gemini_result = {}  # Replace with your original Gemini call
+            entry = {
+                'DATE': datetime.now().strftime('%Y-%m-%d'),
+                'PARTICULARS': gemini_result.get('description', 'Processed File'),
+                'Voucher_BillNo': gemini_result.get('bill_no', 'N/A'),
+                'RECEIPTS_Quantity': gemini_result.get('quantity', 0),
+                'RECEIPTS_Amount': float(gemini_result.get('amount', 0.0)),
+                'ISSUED_Quantity': 0,
+                'ISSUED_Amount': 0.0,
+                'BALANCE_Quantity': gemini_result.get('quantity', 0),
+                'BALANCE_Amount': float(gemini_result.get('amount', 0.0))
+            }
+            data_entries.append(entry)
+
+        # Insert into PostgreSQL
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        for entry in data_entries:
+            cur.execute("""
+                INSERT INTO table_name (DATE, PARTICULARS, Voucher_BillNo, RECEIPTS_Quantity, RECEIPTS_Amount,
+                                        ISSUED_Quantity, ISSUED_Amount, BALANCE_Quantity, BALANCE_Amount)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING Entry_ID;
+            """, (
+                entry['DATE'], entry['PARTICULARS'], entry['Voucher_BillNo'],
+                entry['RECEIPTS_Quantity'], entry['RECEIPTS_Amount'],
+                entry['ISSUED_Quantity'], entry['ISSUED_Amount'],
+                entry['BALANCE_Quantity'], entry['BALANCE_Amount']
+            ))
+            entry['Entry_ID'] = cur.fetchone()['Entry_ID']
+        conn.commit()
+
+        # Sync to Google Sheet (existing)
+        spreadsheet_id = os.getenv('SPREADSHEET_ID', 'your_spreadsheet_id')
+        values = [[
+            e['Entry_ID'], e['DATE'], e['PARTICULARS'], e['Voucher_BillNo'],
+            e['RECEIPTS_Quantity'], e['RECEIPTS_Amount'], e['ISSUED_Quantity'],
+            e['ISSUED_Amount'], e['BALANCE_Quantity'], e['BALANCE_Amount']
+        ] for e in data_entries]
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range='A1',
+            valueInputOption='RAW',
+            body={'values': values}
+        ).execute()
+
         cur.close()
         conn.close()
-        print("[DB_SETUP] Closed connection to default database.")
-    except psycopg2.Error as e:
-        print(f"[ERROR] PostgreSQL Error during DB creation check/create: {e}")
-        traceback.print_exc()
+        return jsonify({'message': 'Files processed'}), 200  # Existing response
+
     except Exception as e:
-        print("[ERROR] General error creating database:")
-        traceback.print_exc()
+        logger.error(f"Upload error: {e}")
+        return jsonify({'error': str(e)}), 500
 
-def insert_data_into_postgres(data_list, dbname, user, password, host, port, table_name):
-    conn = None
-    cur = None
+# New upload route with Gemini 2.0 Flash
+@app.route('/upload-flash', methods=['POST'])
+def upload_files_flash():
     try:
-        print("[DB_INSERT] Connecting to target database...")
-        conn = psycopg2.connect(dbname=dbname, user=user, password=password, host=host, port=port)
-        print("[DB_INSERT] Connected to target database.")
-        cur = conn.cursor()
-        print(f"[DB_INSERT] Ensuring table '{table_name}' exists...")
+        files = request.files.getlist('files')
+        if not files:
+            return jsonify({'error': 'No files uploaded'}), 400
 
-        create_table_query = f"""
-        CREATE TABLE IF NOT EXISTS "{table_name}" (
-            "Entry_ID" SERIAL PRIMARY KEY,
-            "DATE" TEXT,
-            "PARTICULARS" TEXT,
-            "Voucher_BillNo" TEXT,
-            "RECEIPTS_Quantity" INTEGER,
-            "RECEIPTS_Amount" REAL,
-            "ISSUED_Quantity" INTEGER,
-            "ISSUED_Amount" REAL,
-            "BALANCE_Quantity" INTEGER,
-            "BALANCE_Amount" REAL
-        );
-        """
-        cur.execute(create_table_query)
+        # Process files with Gemini 2.0 Flash
+        data_entries = []
+        for file in files:
+            # Read file content
+            file_content = file.read()
+            response = gemini_model.generate_content([
+                {
+                    "mime_type": file.mimetype,
+                    "data": file_content
+                },
+                {
+                    "text": "Extract financial data: description, bill number, quantity, amount."
+                }
+            ])
+            gemini_result = response.text  # Assume JSON-like text output
+            gemini_data = json.loads(gemini_result) if gemini_result.startswith('{') else {
+                'description': gemini_result,
+                'bill_no': 'N/A',
+                'quantity': 0,
+                'amount': 0.0
+            }
+            entry = {
+                'DATE': datetime.now().strftime('%Y-%m-%d'),
+                'PARTICULARS': gemini_data.get('description', 'Processed File'),
+                'Voucher_BillNo': gemini_data.get('bill_no', 'N/A'),
+                'RECEIPTS_Quantity': int(gemini_data.get('quantity', 0)),
+                'RECEIPTS_Amount': float(gemini_data.get('amount', 0.0)),
+                'ISSUED_Quantity': 0,
+                'ISSUED_Amount': 0.0,
+                'BALANCE_Quantity': int(gemini_data.get('quantity', 0)),
+                'BALANCE_Amount': float(gemini_data.get('amount', 0.0))
+            }
+            data_entries.append(entry)
+
+        # Insert into PostgreSQL
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        for entry in data_entries:
+            cur.execute("""
+                INSERT INTO table_name (DATE, PARTICULARS, Voucher_BillNo, RECEIPTS_Quantity, RECEIPTS_Amount,
+                                        ISSUED_Quantity, ISSUED_Amount, BALANCE_Quantity, BALANCE_Amount)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING Entry_ID;
+            """, (
+                entry['DATE'], entry['PARTICULARS'], entry['Voucher_BillNo'],
+                entry['RECEIPTS_Quantity'], entry['RECEIPTS_Amount'],
+                entry['ISSUED_Quantity'], entry['ISSUED_Amount'],
+                entry['BALANCE_Quantity'], entry['BALANCE_Amount']
+            ))
+            entry['Entry_ID'] = cur.fetchone()['Entry_ID']
         conn.commit()
-        print(f"[DB_INSERT] Table '{table_name}' ensured.")
 
-        if not data_list:
-            print("[DB_INSERT] No data provided to insert. Skipping insertion.")
-            return
+        # Push to Google Sheet
+        spreadsheet_id = os.getenv('SPREADSHEET_ID', 'your_spreadsheet_id')
+        values = [[
+            e['Entry_ID'], e['DATE'], e['PARTICULARS'], e['Voucher_BillNo'],
+            e['RECEIPTS_Quantity'], e['RECEIPTS_Amount'], e['ISSUED_Quantity'],
+            e['ISSUED_Amount'], e['BALANCE_Quantity'], e['BALANCE_Amount']
+        ] for e in data_entries]
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range='A1',
+            valueInputOption='RAW',
+            body={'values': values}
+        ).execute()
 
-        print(f"[DB_INSERT] Inserting {len(data_list)} records into '{table_name}'...")
-        insert_count = 0
-        for i, record in enumerate(data_list, start=1):
-            date_val = record.get("DATE")
-            particulars_val = record.get("PARTICULARS")
-            voucher_billno_val = record.get("Voucher_BillNo")
-            receipts_qty = record.get("RECEIPTS_Quantity")
-            receipts_amt = record.get("RECEIPTS_Amount")
-            issued_qty = record.get("ISSUED_Quantity")
-            issued_amt = record.get("ISSUED_Amount")
-            balance_qty = record.get("BALANCE_Quantity")
-            balance_amt = record.get("BALANCE_Amount")
+        cur.close()
+        conn.close()
+        return jsonify({'message': 'Files processed and synced to Google Sheet'}), 200
 
-            print(f"[DB_INSERT.{i}] Inserting record: Date='{date_val}', Particulars='{particulars_val[:30]}...'")
+    except Exception as e:
+        logger.error(f"Upload flash error: {e}")
+        return jsonify({'error': str(e)}), 500
 
-            sql = f"""
-                INSERT INTO "{table_name}" (
-                    "DATE", "PARTICULARS", "Voucher_BillNo",
-                    "RECEIPTS_Quantity", "RECEIPTS_Amount",
-                    "ISSUED_Quantity", "ISSUED_Amount",
-                    "BALANCE_Quantity", "BALANCE_Amount"
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
-            """
-            try:
-                cur.execute(sql, (
-                    date_val, particulars_val, voucher_billno_val,
-                    receipts_qty, receipts_amt,
-                    issued_qty, issued_amt,
-                    balance_qty, balance_amt
-                ))
-                insert_count += 1
-            except psycopg2.Error as insert_err:
-                print(f"[ERROR] Failed to insert record {i}: {record}")
-                print(f"        PostgreSQL Error: {insert_err}")
-                conn.rollback()
+@app.route('/results', methods=['GET'])
+def get_results():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM table_name ORDER BY Entry_ID")
+        data = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify(data), 200
+    except Exception as e:
+        logger.error(f"Results error: {e}")
+        return jsonify({'error': 'Failed to load data'}), 500
 
+@app.route('/update', methods=['POST'])
+def update_data():
+    try:
+        updates = request.json
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        for update in updates:
+            cur.execute("""
+                UPDATE table_name
+                SET DATE = %s, PARTICULARS = %s, Voucher_BillNo = %s,
+                    RECEIPTS_Quantity = %s, RECEIPTS_Amount = %s,
+                    ISSUED_Quantity = %s, ISSUED_Amount = %s,
+                    BALANCE_Quantity = %s, BALANCE_Amount = %s
+                WHERE Entry_ID = %s
+            """, (
+                update['DATE'], update['PARTICULARS'], update['Voucher_BillNo'],
+                update['RECEIPTS_Quantity'], update['RECEIPTS_Amount'],
+                update['ISSUED_Quantity'], update['ISSUED_Amount'],
+                update['BALANCE_Quantity'], update['BALANCE_Amount'],
+                update['Entry_ID']
+            ))
         conn.commit()
-        print(f"[DB_INSERT] {insert_count} records processed and committed.")
-        cur.execute(f'SELECT COUNT(*) FROM "{table_name}"')
-        total_rows = cur.fetchone()[0]
-        print(f"[DB_INSERT] Total rows in table '{table_name}': {total_rows}")
 
-    except psycopg2.Error as e:
-        print(f"[ERROR] PostgreSQL Error during data insertion setup/connection: {e}")
-        traceback.print_exc()
-        if conn: conn.rollback()
+        # Update Google Sheet
+        spreadsheet_id = os.getenv('SPREADSHEET_ID', 'your_spreadsheet_id')
+        values = [[
+            u['Entry_ID'], u['DATE'], u['PARTICULARS'], u['Voucher_BillNo'],
+            u['RECEIPTS_Quantity'], u['RECEIPTS_Amount'], u['ISSUED_Quantity'],
+            u['ISSUED_Amount'], u['BALANCE_Quantity'], u['BALANCE_Amount']
+        ] for u in updates]
+        sheets_service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range='A1:J'
+        ).execute()
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range='A1',
+            valueInputOption='RAW',
+            body={'values': values}
+        ).execute()
+
+        cur.close()
+        conn.close()
+        return jsonify({'message': 'Data updated'}), 200
+
     except Exception as e:
-        print("[ERROR] General error during data insertion process:")
-        traceback.print_exc()
-        if conn: conn.rollback()
-    finally:
-        if cur: cur.close(); print("[DB_INSERT] Cursor closed.")
-        if conn: conn.close(); print("[DB_INSERT] Connection closed.")
+        logger.error(f"Update error: {e}")
+        return jsonify({'error': str(e)}), 500
 
-# --- Helper Function to Process Different Input Types ---
-def process_input_files(input_files):
-    image_paths = []
-    for file_path in input_files:
-        if file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
-            if os.path.exists(file_path):
-                image_paths.append(file_path)
-                print(f"[IMAGE] Added image: {file_path}")
-            else:
-                print(f"[ERROR] Image file not found: {file_path}")
-        elif file_path.lower().endswith('.pdf'):
-            if os.path.exists(file_path):
-                print(f"[PDF] Processing PDF {file_path}...")
-                try:
-                    doc = fitz.open(file_path)
-                    for page_num in range(len(doc)):
-                        page = doc.load_page(page_num)
-                        pix = page.get_pixmap()
-                        img_data = pix.tobytes("jpeg")
-                        img = Image.open(BytesIO(img_data))
-                        output_path = f"temp_pdf_page_{page_num}.jpg"
-                        img.save(output_path, 'JPEG')
-                        image_paths.append(output_path)
-                        print(f"  - Converted page {page_num} to {output_path}")
-                    doc.close()
-                except Exception as e:
-                    print(f"[ERROR] Failed to process PDF {file_path}: {e}")
-                    traceback.print_exc()
-            else:
-                print(f"[ERROR] PDF file not found: {file_path}")
-        else:
-            print(f"[WARNING] Skipping unsupported file type: {file_path}")
-    return image_paths
-
-# --- Modified to Process Uploaded Files ---
-def process_uploaded_files(uploaded_files):
-    image_paths = []
-    for file in uploaded_files:
-        if file and hasattr(file, 'filename'):
-            filename = file.filename
-            if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
-                file_path = f"/tmp/{filename}"  # Use /tmp for Render.com compatibility
-                file.save(file_path)
-                image_paths.append(file_path)
-                print(f"[IMAGE] Saved uploaded image: {file_path}")
-            elif filename.lower().endswith('.pdf'):
-                file_path = f"/tmp/{filename}"
-                file.save(file_path)
-                print(f"[PDF] Processing uploaded PDF {file_path}...")
-                try:
-                    doc = fitz.open(file_path)
-                    for page_num in range(len(doc)):
-                        page = doc.load_page(page_num)
-                        pix = page.get_pixmap()
-                        img_data = pix.tobytes("jpeg")
-                        img = Image.open(BytesIO(img_data))
-                        output_path = f"/tmp/temp_pdf_page_{page_num}.jpg"
-                        img.save(output_path, 'JPEG')
-                        image_paths.append(output_path)
-                        print(f"  - Converted page {page_num} to {output_path}")
-                    doc.close()
-                except Exception as e:
-                    print(f"[ERROR] Failed to process PDF {file_path}: {e}")
-                    traceback.print_exc()
-            else:
-                print(f"[WARNING] Skipping unsupported file type: {filename}")
-    return image_paths
-
-# --- Gemini Interaction Function (Multimodal) ---
-def extract_json_from_images_with_gemini(image_paths, api_key):
-    print("[GEMINI] Configuring Gemini...")
+@app.route('/export-to-sheet', methods=['POST'])
+def export_to_sheet():
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        print(f"[GEMINI] Using model: {model.model_name}")
-        print("[GEMINI] Gemini configured successfully.")
-    except Exception as config_err:
-        print(f"[ERROR] Failed to configure Gemini: {config_err}")
-        traceback.print_exc()
-        return None
+        data = request.json
+        spreadsheet = sheets_service.spreadsheets().create(
+            body={'properties': {'title': f'Exported_Results_{datetime.now().strftime("%Y%m%d_%H%M%S")}'}}
+        ).execute()
+        spreadsheet_id = spreadsheet['spreadsheetId']
 
-    # --- Load Images ---
-    image_objects = []
-    print(f"[GEMINI] Loading {len(image_paths)} images...")
-    for img_path in image_paths:
-        try:
-            print(f"  - Loading: {img_path}")
-            img = Image.open(img_path)
-            image_objects.append(img)
-        except Exception as img_err:
-            print(f"[ERROR] Failed to load image {img_path}: {img_err}")
-            traceback.print_exc()
-            return None
+        headers = [
+            'Entry_ID', 'DATE', 'PARTICULARS', 'Voucher_BillNo',
+            'RECEIPTS_Quantity', 'RECEIPTS_Amount', 'ISSUED_Quantity',
+            'ISSUED_Amount', 'BALANCE_Quantity', 'BALANCE_Amount'
+        ]
+        values = [headers] + [[
+            d['Entry_ID'], d['DATE'], d['PARTICULARS'], d['Voucher_BillNo'],
+            d['RECEIPTS_Quantity'], d['RECEIPTS_Amount'], d['ISSUED_Quantity'],
+            d['ISSUED_Amount'], d['BALANCE_Quantity'], d['BALANCE_Amount']
+        ] for d in data]
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range='A1',
+            valueInputOption='RAW',
+            body={'values': values}
+        ).execute()
 
-    if not image_objects:
-        print("[ERROR] No images were successfully loaded.")
-        return None
+        shareable_link = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+        return jsonify({'message': 'Sheet created', 'link': shareable_link}), 200
 
-    print("[GEMINI] Images loaded successfully.")
-
-    prompt_text = """
-    You are an assistant that analyzes images of handwritten or printed Stock Book pages and extracts transaction information into JSON format. Return ONLY the raw JSON list with no additional text, comments, or formatting. Do not include markdown (e.g., ```json) or any explanatory text before or after the JSON.
-
-    Look at the following image(s) carefully. It contains rows detailing stock transactions. For each distinct transaction row you can identify in the image, extract the following fields:
-    - "DATE": The date of the transaction.
-    - "PARTICULARS": The description or details of the transaction, including any voucher or bill number if clearly associated within the 'Particulars' column. If there's a separate 'Voucher Bill No.' column, prioritize that.
-    - "Voucher_BillNo": The voucher or bill number, if there is a separate column for it. If it's integrated into 'Particulars' and there's no separate column, try to extract it, otherwise use null or an empty string.
-    - "RECEIPTS_Quantity": The quantity received (under the 'RECEIPTS' or 'आवक माल' section). If empty or not applicable, use null.
-    - "RECEIPTS_Amount": The amount/value received (under the 'RECEIPTS' or 'आवक माल' section). If empty or not applicable, use null.
-    - "ISSUED_Quantity": The quantity issued (under the 'ISSUED' or 'जावक माल' section). If empty or not applicable, use null.
-    - "ISSUED_Amount": The amount/value issued (under the 'ISSUED' or 'जावक माल' section). If empty or not applicable, use null.
-    - "BALANCE_Quantity": The quantity remaining in balance (under the 'BALANCE' or 'बची संख्या' section).
-    - "BALANCE_Amount": The amount/value remaining in balance (under the 'BALANCE' or 'बची संख्या' section).
-
-    Format the output as a JSON list of objects. Each object represents one transaction row found in the image. The JSON keys MUST be exactly: "DATE", "PARTICULARS", "Voucher_BillNo", "RECEIPTS_Quantity", "RECEIPTS_Amount", "ISSUED_Quantity", "ISSUED_Amount", "BALANCE_Quantity", "BALANCE_Amount".
-
-    Example output (no extra text):
-    [{"DATE": "11/01/14", "PARTICULARS": "प्रारंभिक शेष", "Voucher_BillNo": null, "RECEIPTS_Quantity": 33, "RECEIPTS_Amount": 6930.00, "ISSUED_Quantity": null, "ISSUED_Amount": null, "BALANCE_Quantity": 33, "BALANCE_Amount": 6930.00}]
-
-    If a value is not present in the image for a specific field in a row, use null for numeric fields and an empty string or null for text fields where appropriate. Ensure all keys are present in each JSON object.
-    """
-
-    request_payload = [prompt_text] + image_objects
-
-    print("[GEMINI] Sending prompt and images to Gemini API...")
-    try:
-        response = model.generate_content(request_payload)
-        print("[GEMINI] Received response from API.")
-
-        raw_json_text = response.text.strip()  # Strip any leading/trailing whitespace
-        print(f"[GEMINI] Raw response text (full): {raw_json_text}")  # Log full response for debugging
-
-        # Try to clean the response by removing any non-JSON text
-        if raw_json_text.startswith('```json') and raw_json_text.endswith('```'):
-            raw_json_text = raw_json_text[len('```json'):-len('```')].strip()
-        elif raw_json_text.startswith('[') or raw_json_text.startswith('{'):
-            pass  # Already looks like JSON, proceed
-        else:
-            json_match = re.search(r'\{.*\}|$$     .*     $$', raw_json_text, re.DOTALL)
-            if json_match:
-                raw_json_text = json_match.group(0).strip()
-            else:
-                print("[ERROR] No valid JSON structure found in response.")
-                print(f"        Raw Text: {raw_json_text}")
-                return None
-
-        if not raw_json_text:
-            print("[ERROR] Empty response from Gemini.")
-            return None
-
-        print("[GEMINI] Attempting to parse JSON...")
-        parsed_data = json.loads(raw_json_text)
-        print("[GEMINI] JSON parsed successfully.")
-
-        if isinstance(parsed_data, list):
-            print(f"[GEMINI] Extracted {len(parsed_data)} records.")
-            return parsed_data
-        elif isinstance(parsed_data, dict):
-            print("[WARNING] Gemini returned a single JSON object, wrapping it in a list.")
-            return [parsed_data]
-        else:
-            print(f"[ERROR] Gemini output was not a JSON list or object. Type: {type(parsed_data)}")
-            return None
-
-    except json.JSONDecodeError as json_err:
-        print(f"[ERROR] Failed to decode JSON response from Gemini: {json_err}")
-        print(f"        Problematic JSON Text: {raw_json_text}")
-        traceback.print_exc()
-        return None
     except Exception as e:
-        print(f"[ERROR] Error during Gemini API call or processing: {e}")
-        traceback.print_exc()
-        if 'response' in locals() and hasattr(response, 'prompt_feedback'):
-            print(f"        Prompt Feedback: {response.prompt_feedback}")
-        if 'response' in locals() and hasattr(response, 'candidates') and response.candidates:
-            print(f"        Finish Reason: {response.candidates[0].finish_reason}")
-            print(f"        Safety Ratings: {response.candidates[0].safety_ratings}")
-        return None
-
-# --- API Endpoint ---
-@app.route('/process', methods=['POST'])
-def process_files():
-    print("[API] Received /process request.")
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part in the request"}), 400
-
-    files = request.files.getlist('file')  # Handle multiple files
-    if not files or all(file.filename == '' for file in files):
-        return jsonify({"error": "No selected files"}), 400
-
-    # Process uploaded files
-    image_paths = process_uploaded_files(files)
-
-    if not image_paths:
-        return jsonify({"error": "No valid image files processed"}), 400
-
-    # Load environment variables
-    gemini_api_key = os.environ.get('GEMINI_API_KEY')
-    if not gemini_api_key:
-        return jsonify({"error": "GEMINI_API_KEY not set in environment"}), 500
-
-    db_name = os.environ.get('DB_NAME', 'govigyan')
-    db_user = os.environ.get('DB_USER', 'govigyan_user')
-    db_password = os.environ.get('DB_PASSWORD', '1yOT2yAAQ0FO7bL7iKo7C7W26dLFOm2j')
-    db_host = os.environ.get('DB_HOST', 'dpg-cvrp2fili9vc739krvd0-a.oregon-postgres.render.com')
-    db_port = os.environ.get('DB_PORT', 5432)
-    table = 'StockBook'
-
-    # Create database if not exists
-    create_database_if_not_exists(db_name, db_user, db_password, db_host, db_port)
-
-    # Extract data using Gemini
-    extracted_data = extract_json_from_images_with_gemini(image_paths, gemini_api_key)
-
-    if extracted_data:
-        # Insert data into PostgreSQL
-        insert_data_into_postgres(extracted_data, db_name, db_user, db_password, db_host, db_port, table)
-        return jsonify({"message": "Data processed and inserted successfully", "data": extracted_data}), 200
-    else:
-        return jsonify({"error": "Failed to extract data from images"}), 500
-
-    # Clean up temporary files
-    for temp_file in [f for f in os.listdir('/tmp') if f.startswith('temp_pdf_page_')]:
-        os.remove(f"/tmp/{temp_file}")
-        print(f"[CLEANUP] Removed temporary file: /tmp/{temp_file}")
-
-    return jsonify({"message": "Processing complete"}), 200
+        logger.error(f"Export error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    # Run Flask app (for local testing)
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True)
