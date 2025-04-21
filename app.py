@@ -15,9 +15,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "https://your-deployed-frontend.com"], 
-                            "methods": ["GET", "POST", "OPTIONS"], 
-                            "allow_headers": ["Content-Type"]}})
+CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "https://your-deployed-frontend.com"],
+                                 "methods": ["GET", "POST", "OPTIONS"],
+                                 "allow_headers": ["Content-Type"]}})
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, filename='app.log')
@@ -58,7 +58,7 @@ def get_db_connection():
         logger.error(f"Database connection failed: {e}")
         raise
 
-# Existing upload route (preserved)
+# Existing upload route (preserved - needs adaptation if used for student data)
 @app.route('/upload', methods=['POST', 'OPTIONS'])
 def upload_files():
     if request.method == 'OPTIONS':
@@ -76,39 +76,31 @@ def upload_files():
         for file in files:
             gemini_result = {}  # Replace with your original Gemini logic
             entry = {
-                'DATE': datetime.now().strftime('%Y-%m-%d'),
-                'PARTICULARS': gemini_result.get('description', 'Processed File'),
-                'Voucher_BillNo': gemini_result.get('bill_no', 'N/A'),
-                'RECEIPTS_Quantity': gemini_result.get('quantity', 0),
-                'RECEIPTS_Amount': float(gemini_result.get('amount', 0.0)),
-                'ISSUED_Quantity': 0,
-                'ISSUED_Amount': 0.0,
-                'BALANCE_Quantity': gemini_result.get('quantity', 0),
-                'BALANCE_Amount': float(gemini_result.get('amount', 0.0))
+                'बालकांचे नाव': gemini_result.get('name', 'Processed File'),
+                'वजन (किलो)': gemini_result.get('weight'),
+                'उंची (सेमी)': gemini_result.get('height'),
+                'शेरा': gemini_result.get('remark')
             }
             data_entries.append(entry)
 
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         for entry in data_entries:
-            cur.execute("""
-                INSERT INTO table_name (DATE, PARTICULARS, Voucher_BillNo, RECEIPTS_Quantity, RECEIPTS_Amount,
-                                        ISSUED_Quantity, ISSUED_Amount, BALANCE_Quantity, BALANCE_Amount)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING Entry_ID;
+            cur.execute(f"""
+                INSERT INTO student_data_from_image ("बालकांचे नाव", "वजन (किलो)", "उंची (सेमी)", "शेरा")
+                VALUES (%s, %s, %s, %s)
+                RETURNING "अ.क्र.";
             """, (
-                entry['DATE'], entry['PARTICULARS'], entry['Voucher_BillNo'],
-                entry['RECEIPTS_Quantity'], entry['RECEIPTS_Amount'],
-                entry['ISSUED_Quantity'], entry['ISSUED_Amount'],
-                entry['BALANCE_Quantity'], entry['BALANCE_Amount']
+                entry.get("बालकांचे नाव"),
+                entry.get("वजन (किलो)"),
+                entry.get("उंची (सेमी)"),
+                entry.get("शेरा")
             ))
-            entry['Entry_ID'] = cur.fetchone()['Entry_ID']
+            entry['अ.क्र.'] = cur.fetchone()['अ.क्र.']
         conn.commit()
 
         spreadsheet_id = os.getenv('SPREADSHEET_ID', 'your_spreadsheet_id')
-        values = [[e['Entry_ID'], e['DATE'], e['PARTICULARS'], e['Voucher_BillNo'],
-                   e['RECEIPTS_Quantity'], e['RECEIPTS_Amount'], e['ISSUED_Quantity'],
-                   e['ISSUED_Amount'], e['BALANCE_Quantity'], e['BALANCE_Amount']] 
+        values = [[e['अ.क्र.'], None, e.get("बालकांचे नाव"), e.get("वजन (किलो)"), e.get("उंची (सेमी)"), e.get("शेरा")]
                   for e in data_entries]
         sheets_service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
@@ -148,24 +140,27 @@ def upload_files_flash():
                 logger.debug(f"Processing file: {file.filename}, size: {len(file_content)} bytes")
                 response = gemini_model.generate_content([
                     {"mime_type": file.mimetype, "data": file_content},
-                    {"text": "Extract financial data: description, bill number, quantity, amount."}
+                    {"text": "Extract student data: name, weight (kg), height (cm), remark."}
                 ])
                 gemini_result = response.text
                 logger.debug(f"Gemini result: {gemini_result}")
-                gemini_data = json.loads(gemini_result) if gemini_result.startswith('{') else {
-                    'description': gemini_result, 'bill_no': 'N/A', 'quantity': 0, 'amount': 0.0
-                }
-                entry = {
-                    'DATE': datetime.now().strftime('%Y-%m-%d'),
-                    'PARTICULARS': gemini_data.get('description', 'Processed File'),
-                    'Voucher_BillNo': gemini_data.get('bill_no', 'N/A'),
-                    'RECEIPTS_Quantity': int(gemini_data.get('quantity', 0)),
-                    'RECEIPTS_Amount': float(gemini_data.get('amount', 0.0)),
-                    'ISSUED_Quantity': 0,
-                    'ISSUED_Amount': 0.0,
-                    'BALANCE_Quantity': int(gemini_data.get('quantity', 0)),
-                    'BALANCE_Amount': float(gemini_data.get('amount', 0.0))
-                }
+                try:
+                    gemini_data = json.loads(gemini_result)
+                    entry = {
+                        "बालकांचे नाव": gemini_data.get('name'),
+                        "वजन (किलो)": gemini_data.get('weight'),
+                        "उंची (सेमी)": gemini_data.get('height'),
+                        "शेरा": gemini_data.get('remark')
+                    }
+                except json.JSONDecodeError:
+                    # Fallback if Gemini doesn't return JSON in the expected format
+                    parts = gemini_result.split(',')
+                    entry = {
+                        "बालकांचे नाव": parts[0].strip() if len(parts) > 0 else None,
+                        "वजन (किलो)": parts[1].strip() if len(parts) > 1 else None,
+                        "उंची (सेमी)": parts[2].strip() if len(parts) > 2 else None,
+                        "शेरा": parts[3].strip() if len(parts) > 3 else None,
+                    }
                 data_entries.append(entry)
             except Exception as e:
                 logger.error(f"Gemini processing failed for {file.filename}: {e}")
@@ -175,25 +170,22 @@ def upload_files_flash():
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         for entry in data_entries:
-            cur.execute("""
-                INSERT INTO table_name (DATE, PARTICULARS, Voucher_BillNo, RECEIPTS_Quantity, RECEIPTS_Amount,
-                                        ISSUED_Quantity, ISSUED_Amount, BALANCE_Quantity, BALANCE_Amount)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING Entry_ID;
+            cur.execute(f"""
+                INSERT INTO student_data_from_image ("बालकांचे नाव", "वजन (किलो)", "उंची (सेमी)", "शेरा")
+                VALUES (%s, %s, %s, %s)
+                RETURNING "अ.क्र.";
             """, (
-                entry['DATE'], entry['PARTICULARS'], entry['Voucher_BillNo'],
-                entry['RECEIPTS_Quantity'], entry['RECEIPTS_Amount'],
-                entry['ISSUED_Quantity'], entry['ISSUED_Amount'],
-                entry['BALANCE_Quantity'], entry['BALANCE_Amount']
+                entry.get("बालकांचे नाव"),
+                entry.get("वजन (किलो)"),
+                entry.get("उंची (सेमी)"),
+                entry.get("शेरा")
             ))
-            entry['Entry_ID'] = cur.fetchone()['Entry_ID']
+            entry['अ.क्र.'] = cur.fetchone()['अ.क्र.']
         conn.commit()
 
         logger.info("Syncing to Google Sheets")
         spreadsheet_id = os.getenv('SPREADSHEET_ID', 'your_spreadsheet_id')
-        values = [[e['Entry_ID'], e['DATE'], e['PARTICULARS'], e['Voucher_BillNo'],
-                   e['RECEIPTS_Quantity'], e['RECEIPTS_Amount'], e['ISSUED_Quantity'],
-                   e['ISSUED_Amount'], e['BALANCE_Quantity'], e['BALANCE_Amount']] 
+        values = [[e['अ.क्र.'], None, e.get("बालकांचे नाव"), e.get("वजन (किलो)"), e.get("उंची (सेमी)"), e.get("शेरा")]
                   for e in data_entries]
         sheets_service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
@@ -217,7 +209,7 @@ def get_results():
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT * FROM table_name ORDER BY Entry_ID")
+        cur.execute("SELECT * FROM student_data_from_image ORDER BY \"अ.क्र.\"")
         data = cur.fetchall()
         cur.close()
         conn.close()
@@ -235,27 +227,23 @@ def update_data():
         cur = conn.cursor(cursor_factory=RealDictCursor)
         for update in updates:
             cur.execute("""
-                UPDATE table_name
-                SET DATE = %s, PARTICULARS = %s, Voucher_BillNo = %s,
-                    RECEIPTS_Quantity = %s, RECEIPTS_Amount = %s,
-                    ISSUED_Quantity = %s, ISSUED_Amount = %s,
-                    BALANCE_Quantity = %s, BALANCE_Amount = %s
-                WHERE Entry_ID = %s
+                UPDATE student_data_from_image
+                SET "वर्ग क्र." = %s, "बालकांचे नाव" = %s, "वजन (किलो)" = %s, "उंची (सेमी)" = %s, "शेरा" = %s
+                WHERE "अ.क्र." = %s
             """, (
-                update['DATE'], update['PARTICULARS'], update['Voucher_BillNo'],
-                update['RECEIPTS_Quantity'], update['RECEIPTS_Amount'],
-                update['ISSUED_Quantity'], update['ISSUED_Amount'],
-                update['BALANCE_Quantity'], update['BALANCE_Amount'],
-                update['Entry_ID']
+                update.get("वर्ग क्र."),
+                update.get("बालकांचे नाव"),
+                update.get("वजन (किलो)"),
+                update.get("उंची (सेमी)"),
+                update.get("शेरा"),
+                update.get("अ.क्र.")
             ))
         conn.commit()
 
         spreadsheet_id = os.getenv('SPREADSHEET_ID', 'your_spreadsheet_id')
-        values = [[u['Entry_ID'], u['DATE'], u['PARTICULARS'], u['Voucher_BillNo'],
-                   u['RECEIPTS_Quantity'], u['RECEIPTS_Amount'], u['ISSUED_Quantity'],
-                   u['ISSUED_Amount'], u['BALANCE_Quantity'], u['BALANCE_Amount']] 
+        values = [[u.get("अ.क्र."), u.get("वर्ग क्र."), u.get("बालकांचे नाव"), u.get("वजन (किलो)"), u.get("उंची (सेमी)"), u.get("शेरा")]
                   for u in updates]
-        sheets_service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range='A1:J').execute()
+        sheets_service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range='A1:F').execute()
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id, range='A1', valueInputOption='RAW', body={'values': values}
         ).execute()
@@ -277,11 +265,8 @@ def export_to_sheet():
         ).execute()
         spreadsheet_id = spreadsheet['spreadsheetId']
 
-        headers = ['Entry_ID', 'DATE', 'PARTICULARS', 'Voucher_BillNo', 'RECEIPTS_Quantity', 
-                   'RECEIPTS_Amount', 'ISSUED_Quantity', 'ISSUED_Amount', 'BALANCE_Quantity', 'BALANCE_Amount']
-        values = [headers] + [[d['Entry_ID'], d['DATE'], d['PARTICULARS'], d['Voucher_BillNo'],
-                               d['RECEIPTS_Quantity'], d['RECEIPTS_Amount'], d['ISSUED_Quantity'],
-                               d['ISSUED_Amount'], d['BALANCE_Quantity'], d['BALANCE_Amount']] 
+        headers = ["अ.क्र.", "वर्ग क्र.", "बालकांचे नाव", "वजन (किलो)", "उंची (सेमी)", "शेरा"]
+        values = [headers] + [[d.get("अ.क्र."), d.get("वर्ग क्र."), d.get("बालकांचे नाव"), d.get("वजन (किलो)"), d.get("उंची (सेमी)"), d.get("शेरा")]
                               for d in data]
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id, range='A1', valueInputOption='RAW', body={'values': values}
@@ -297,3 +282,12 @@ def export_to_sheet():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
+
+# Column Name     | Data Type
+# -----------------|--------------
+# अ.क्र.          | INTEGER PRIMARY KEY
+# वर्ग क्र.        | INTEGER
+# बालकांचे नाव   | VARCHAR(255) NOT NULL
+# वजन (किलो)      | DECIMAL
+# उंची (सेमी)     | DECIMAL
+# शेरा           | VARCHAR(50)
