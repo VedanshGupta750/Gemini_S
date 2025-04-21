@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Database connection
 DB_PARAMS = {
-    'dbname': os.getenv('DB_NAME', 'your_db'),
+    'dbname': os.getenv('DB_NAME', 'student_data_from_image'),  # Changed database name here
     'user': os.getenv('DB_USER', 'your_user'),
     'password': os.getenv('DB_PASSWORD', 'your_password'),
     'host': os.getenv('DB_HOST', 'your_host'),
@@ -282,12 +282,3 @@ def export_to_sheet():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
-
-# Column Name     | Data Type
-# -----------------|--------------
-# अ.क्र.          | INTEGER PRIMARY KEY
-# वर्ग क्र.        | INTEGER
-# बालकांचे नाव   | VARCHAR(255) NOT NULL
-# वजन (किलो)      | DECIMAL
-# उंची (सेमी)     | DECIMAL
-# शेरा           | VARCHAR(50)
